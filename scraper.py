@@ -1,14 +1,12 @@
 """
-Stadswonen Rotterdam aanbod-scraper.
+Stadswonen Rotterdam aanbod-scraper — v2
 
-Laadt https://www.stadswonenrotterdam.nl/nl/aanbod met een headless browser,
-wacht tot de listings zijn ingeladen, en filtert op:
-- max prijs
-- voorkeur-wijken
-- geslachtsvoorkeur (advertentie moet 'man' of geen voorkeur zijn)
-
-Nieuwe matches worden gemeld via notify.py.
-Reeds gemelde advertenties staan in seen.json en worden overgeslagen.
+Verbeteringen t.o.v. v1:
+- Leest tekst direct van de <a>-tag (niet de container)
+- Paginering: klikt door alle pagina's
+- Wijk-check op zowel adres als wijknaam (Kralingen-check werkt nu ook
+  als Stadswonen de wijk 'De Snor' noemt maar het adres 'Kralingse...' bevat)
+- Centrum-check: matcht 'stadscentrum', 'centrum', 'coolsingel' etc.
 """
 
 import json
@@ -27,13 +25,19 @@ URL = "https://www.stadswonenrotterdam.nl/nl/aanbod"
 SEEN_FILE = Path(__file__).parent / "seen.json"
 DEBUG_HTML = Path(__file__).parent / "last_page.html"
 
-MAX_PRICE = float(os.environ.get("MAX_PRICE", "500"))
-# kleine, ruime, accent-tolerante lijst — wordt case-insensitive gematched
-WIJKEN = [w.strip().lower() for w in os.environ.get(
-    "WIJKEN", "centrum,kralingen"
-).split(",") if w.strip()]
-# 'man' = alleen advertenties zonder voorkeur of die specifiek man toelaten
+MAX_PRICE_KAMER = float(os.environ.get("MAX_PRICE_KAMER", "500"))
+MAX_PRICE_STUDIO = float(os.environ.get("MAX_PRICE_STUDIO", "600"))
 GENDER = os.environ.get("GENDER", "man").lower()
+
+# Zoektermen per wijk — matcht op adres + wijknaam samen (case-insensitive)
+WIJK_TERMEN: list[list[str]] = [
+    # Centrum / Stadscentrum / bekende centrumstraten
+    ["stadscentrum", "centrum", "coolsingel", "blaak", "meent", "hoogstraat",
+     "witte de with", "westblaak", "schiedamse vest", "eendrachtsplein"],
+    # Kralingen — ook als Stadswonen een andere buurt-/complexnaam gebruikt
+    ["kralingen", "kralingse", "kralingsche", "de snor", "kralingsveen",
+     "boerengat", "kralingse zoom"],
+]
 
 
 # ---------------------------------------------------------------- helpers
@@ -51,9 +55,7 @@ def save_seen(seen: Iterable[str]) -> None:
 
 
 def parse_price(text: str) -> float | None:
-    """Pak het eerste bedrag uit een tekstblok, ondersteunt '€ 1.234,56' en '€499'."""
-    # Verwijder duizendtal-punten, vervang decimaal-komma door punt
-    m = re.search(r"€\s*([\d\.\,]+)", text)
+    m = re.search(r"€\s*([\d\.]+(?:,\d+)?)", text)
     if not m:
         return None
     raw = m.group(1).replace(".", "").replace(",", ".")
@@ -64,50 +66,24 @@ def parse_price(text: str) -> float | None:
 
 
 def gender_ok(text: str) -> bool:
-    """
-    Bekijk hoe de advertentie geslacht beschrijft.
-    Accepteer als:
-      - er helemaal geen voorkeur staat (de meeste advertenties), of
-      - de voorkeur 'man' bevat, of
-      - 'geen voorkeur' / 'm/v' / 'iedereen' wordt genoemd
-    Weiger expliciet als er alleen 'vrouw' / 'vrouwelijk' staat zonder 'man'.
-    """
     t = text.lower()
-
-    # Trefwoorden die op geslachtsvoorkeur duiden
-    has_gender_signal = any(k in t for k in (
-        "geslacht", "voorkeur", "vrouw", "man", "m/v", "v/m"
-    ))
-    if not has_gender_signal:
-        return True  # geen melding van geslacht → ok
-
-    if GENDER == "man":
-        if "vrouw" in t and "man" not in t and "m/v" not in t and "v/m" not in t:
-            return False
-        return True
-
-    if GENDER == "vrouw":
-        if "man" in t and "vrouw" not in t and "m/v" not in t and "v/m" not in t:
-            return False
-        return True
-
-    return True  # GENDER='alles' o.i.d.
+    if "geslacht: vrouw" in t:
+        return False
+    return True
 
 
 def wijk_ok(text: str) -> bool:
     t = text.lower()
-    return any(w in t for w in WIJKEN)
+    for termen in WIJK_TERMEN:
+        if any(term in t for term in termen):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- scrape
 def fetch_listings() -> list[dict]:
-    """
-    Haal de aanbod-pagina op en probeer listings te extraheren.
+    results: dict[str, dict] = {}
 
-    Strategie: laad pagina, scroll naar onder (lazy loading), pak alle links
-    die naar individuele aanbod-detailpagina's wijzen, en gebruik hun
-    container-element als bron-tekst voor prijs/wijk/geslacht-info.
-    """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(
@@ -125,65 +101,72 @@ def fetch_listings() -> list[dict]:
             "button:has-text('Accepteer')",
             "button:has-text('Akkoord')",
             "button:has-text('Alles toestaan')",
+            "button:has-text('Toestemmen')",
         ):
             try:
                 page.locator(sel).first.click(timeout=2_000)
+                page.wait_for_timeout(500)
                 break
             except Exception:
                 pass
 
-        # Wacht tot er listing-achtige content is. We gebruiken een ruime hint:
-        # de detailpagina's hebben /nl/aanbod/<id> als pad.
-        try:
-            page.wait_for_selector("a[href*='/nl/aanbod/']", timeout=15_000)
-        except Exception:
-            # Misschien een andere URL-structuur — sla pagina op voor debug
-            DEBUG_HTML.write_text(page.content())
-            browser.close()
-            print(
-                "WAARSCHUWING: geen listings gedetecteerd via "
-                "a[href*='/nl/aanbod/']. Pagina opgeslagen in "
-                f"{DEBUG_HTML.name} voor inspectie.",
-                file=sys.stderr,
-            )
-            return []
+        pagina = 1
+        while True:
+            print(f"Scraping pagina {pagina}...")
 
-        # Scroll om lazy-loaded items op te halen
-        for _ in range(6):
-            page.mouse.wheel(0, 4000)
-            page.wait_for_timeout(800)
-
-        # Bewaar gerenderde HTML voor debug — handig om selectors te tunen
-        DEBUG_HTML.write_text(page.content())
-
-        # Verzamel unieke aanbod-links + hun zichtbare container-tekst
-        anchors = page.locator("a[href*='/nl/aanbod/']")
-        n = anchors.count()
-        out: dict[str, dict] = {}
-        for i in range(n):
-            a = anchors.nth(i)
-            href = a.get_attribute("href") or ""
-            # Negeer de overzichtspagina zelf en duplicates
-            if href.rstrip("/").endswith("/aanbod"):
-                continue
-            url = href if href.startswith("http") else f"https://www.stadswonenrotterdam.nl{href}"
-            if url in out:
-                continue
-            # Pak de tekst van de dichtstbijzijnde 'card'-container
             try:
-                card = a.locator(
-                    "xpath=ancestor::*[self::article or self::li or "
-                    "contains(@class,'card') or contains(@class,'Card')][1]"
-                )
-                blob = (card.inner_text(timeout=2_000) or "").strip()
-                if not blob:
-                    blob = (a.inner_text(timeout=2_000) or "").strip()
+                page.wait_for_selector("a[href*='/nl/aanbod/']", timeout=15_000)
             except Exception:
-                blob = (a.inner_text(timeout=2_000) or "").strip()
-            out[url] = {"url": url, "text": blob}
+                DEBUG_HTML.write_text(page.content())
+                print(
+                    f"WAARSCHUWING: geen listings op pagina {pagina}. "
+                    f"HTML opgeslagen als {DEBUG_HTML.name}",
+                    file=sys.stderr,
+                )
+                break
+
+            if pagina == 1:
+                DEBUG_HTML.write_text(page.content())
+
+            anchors = page.locator("a[href*='/nl/aanbod/']")
+            n = anchors.count()
+            for i in range(n):
+                a = anchors.nth(i)
+                href = a.get_attribute("href") or ""
+                if href.rstrip("/").endswith("/aanbod"):
+                    continue
+                url = (
+                    href
+                    if href.startswith("http")
+                    else f"https://www.stadswonenrotterdam.nl{href}"
+                )
+                if url in results:
+                    continue
+                try:
+                    blob = (a.inner_text(timeout=2_000) or "").strip()
+                except Exception:
+                    blob = ""
+                results[url] = {"url": url, "text": blob}
+
+            # Volgende pagina knop — niet disabled
+            volgende = page.locator(
+                "button:has(span:has-text('Ga naar volgende pagina')):not([disabled])"
+            )
+            if volgende.count() == 0:
+                print("Laatste pagina bereikt.")
+                break
+
+            volgende.first.click()
+            page.wait_for_timeout(2_000)
+            pagina += 1
+
+            if pagina > 20:
+                print("Paginalimiet bereikt (20).")
+                break
 
         browser.close()
-        return list(out.values())
+
+    return list(results.values())
 
 
 # ---------------------------------------------------------------- match
@@ -193,48 +176,63 @@ def matches_filters(listing: dict) -> tuple[bool, str]:
 
     if price is None:
         return False, "geen prijs gevonden"
-    if price > MAX_PRICE:
-        return False, f"prijs €{price:.0f} > €{MAX_PRICE:.0f}"
+
+    # Bepaal type op basis van eerste woord in de card-tekst
+    is_studio = text.lower().lstrip().startswith("studio")
+    limiet = MAX_PRICE_STUDIO if is_studio else MAX_PRICE_KAMER
+    type_label = "studio" if is_studio else "kamer"
+
+    if price > limiet:
+        return False, f"prijs E{price:.0f} > max E{limiet:.0f} ({type_label})"
     if not wijk_ok(text):
         return False, "wijk niet in voorkeurslijst"
     if not gender_ok(text):
-        return False, "geslachtsvoorkeur mismatch"
+        return False, "geslacht: vrouw"
     return True, "match"
 
 
 # ---------------------------------------------------------------- main
 def main() -> int:
     listings = fetch_listings()
-    print(f"Gevonden listings op pagina: {len(listings)}")
+    print(f"Totaal listings gevonden: {len(listings)}")
 
     seen = load_seen()
-    new_matches = []
+    new_matches: list[dict] = []
+
     for lst in listings:
         ok, reason = matches_filters(lst)
+        status = "MATCH" if ok else f"skip ({reason})"
+        label = next(
+            (ln.strip() for ln in lst["text"].splitlines() if ln.strip()),
+            lst["url"],
+        )
+        print(f"  {status} | {label[:70]}")
+
         if not ok:
             continue
         if lst["url"] in seen:
+            print(f"    -> al gezien, skip")
             continue
         new_matches.append(lst)
         seen.add(lst["url"])
 
-    print(f"Nieuwe matches: {len(new_matches)}")
+    print(f"\nNieuwe matches: {len(new_matches)}")
 
     for m in new_matches:
-        # Telegram bericht — kort, prijs + eerste regels + link
+        price = parse_price(m["text"])
         first_line = next(
             (ln.strip() for ln in m["text"].splitlines() if ln.strip()),
             "Nieuwe kamer",
         )
-        price = parse_price(m["text"])
         msg = (
-            f"🏠 *Nieuwe kamer* — €{price:.0f}/mnd\n"
+            f"Nieuwe kamer - E{price:.0f}/mnd\n"
             f"{first_line}\n\n{m['url']}"
         )
         try:
             send_telegram(msg)
+            print(f"  Telegram verstuurd: {first_line[:50]}")
         except Exception as e:
-            print(f"Telegram-fout: {e}", file=sys.stderr)
+            print(f"  Telegram-fout: {e}", file=sys.stderr)
 
     save_seen(seen)
     return 0
