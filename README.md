@@ -1,6 +1,6 @@
 # Stadswonen Rotterdam — kamer-alert
 
-Checkt elke 15 minuten het aanbod van Stadswonen Rotterdam en stuurt je een
+Checkt elke 120 minuten het aanbod van Stadswonen Rotterdam en stuurt je een
 Telegram-bericht zodra er een nieuwe kamer is die aan jouw filters voldoet.
 
 ## Filters (standaard)
