@@ -1,12 +1,9 @@
 """
-Stadswonen Rotterdam aanbod-scraper — v2
+Stadswonen Rotterdam aanbod-scraper — v3
 
-Verbeteringen t.o.v. v1:
-- Leest tekst direct van de <a>-tag (niet de container)
-- Paginering: klikt door alle pagina's
-- Wijk-check op zowel adres als wijknaam (Kralingen-check werkt nu ook
-  als Stadswonen de wijk 'De Snor' noemt maar het adres 'Kralingse...' bevat)
-- Centrum-check: matcht 'stadscentrum', 'centrum', 'coolsingel' etc.
+Fixes:
+- Cookie-popup (Cookiebot) wordt geforceerd gesloten via JS
+  zodat de overlay de paginering-knop niet meer blokkeert
 """
 
 import json
@@ -29,12 +26,9 @@ MAX_PRICE_KAMER = float(os.environ.get("MAX_PRICE_KAMER", "500"))
 MAX_PRICE_STUDIO = float(os.environ.get("MAX_PRICE_STUDIO", "600"))
 GENDER = os.environ.get("GENDER", "man").lower()
 
-# Zoektermen per wijk — matcht op adres + wijknaam samen (case-insensitive)
 WIJK_TERMEN: list[list[str]] = [
-    # Centrum / Stadscentrum / bekende centrumstraten
     ["stadscentrum", "centrum", "coolsingel", "blaak", "meent", "hoogstraat",
      "witte de with", "westblaak", "schiedamse vest", "eendrachtsplein"],
-    # Kralingen — ook als Stadswonen een andere buurt-/complexnaam gebruikt
     ["kralingen", "kralingse", "kralingsche", "de snor", "kralingsveen",
      "boerengat", "kralingse zoom"],
 ]
@@ -66,8 +60,7 @@ def parse_price(text: str) -> float | None:
 
 
 def gender_ok(text: str) -> bool:
-    t = text.lower()
-    if "geslacht: vrouw" in t:
+    if "geslacht: vrouw" in text.lower():
         return False
     return True
 
@@ -78,6 +71,39 @@ def wijk_ok(text: str) -> bool:
         if any(term in t for term in termen):
             return True
     return False
+
+
+def dismiss_cookie_popup(page) -> None:
+    """Probeer de Cookiebot-popup te sluiten via klik, daarna via JS als fallback."""
+    for sel in (
+        "button:has-text('Accepteer')",
+        "button:has-text('Akkoord')",
+        "button:has-text('Alles toestaan')",
+        "button:has-text('Toestemmen')",
+    ):
+        try:
+            page.locator(sel).first.click(timeout=2_000)
+            page.wait_for_timeout(800)
+            break
+        except Exception:
+            pass
+
+    # Verwijder Cookiebot-overlay volledig uit de DOM via JS
+    page.evaluate("""() => {
+        const ids = [
+            'CybotCookiebotDialog',
+            'CybotCookiebotDialogBodyUnderlay',
+            'CookiebotWidget',
+        ];
+        ids.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.remove();
+        });
+        // Verwijder ook eventuele body-scroll-lock
+        document.body.style.overflow = '';
+        document.documentElement.style.overflow = '';
+    }""")
+    page.wait_for_timeout(300)
 
 
 # ---------------------------------------------------------------- scrape
@@ -96,19 +122,7 @@ def fetch_listings() -> list[dict]:
         page = ctx.new_page()
         page.goto(URL, wait_until="networkidle", timeout=60_000)
 
-        # Cookie-popup wegklikken (best effort)
-        for sel in (
-            "button:has-text('Accepteer')",
-            "button:has-text('Akkoord')",
-            "button:has-text('Alles toestaan')",
-            "button:has-text('Toestemmen')",
-        ):
-            try:
-                page.locator(sel).first.click(timeout=2_000)
-                page.wait_for_timeout(500)
-                break
-            except Exception:
-                pass
+        dismiss_cookie_popup(page)
 
         pagina = 1
         while True:
@@ -136,8 +150,7 @@ def fetch_listings() -> list[dict]:
                 if href.rstrip("/").endswith("/aanbod"):
                     continue
                 url = (
-                    href
-                    if href.startswith("http")
+                    href if href.startswith("http")
                     else f"https://www.stadswonenrotterdam.nl{href}"
                 )
                 if url in results:
@@ -148,7 +161,9 @@ def fetch_listings() -> list[dict]:
                     blob = ""
                 results[url] = {"url": url, "text": blob}
 
-            # Volgende pagina knop — niet disabled
+            # Zorg dat de overlay er niet meer is voor we klikken
+            dismiss_cookie_popup(page)
+
             volgende = page.locator(
                 "button:has(span:has-text('Ga naar volgende pagina')):not([disabled])"
             )
@@ -156,7 +171,8 @@ def fetch_listings() -> list[dict]:
                 print("Laatste pagina bereikt.")
                 break
 
-            volgende.first.click()
+            # Klik via JS om overlay-interferentie te omzeilen
+            volgende.first.evaluate("el => el.click()")
             page.wait_for_timeout(2_000)
             pagina += 1
 
@@ -177,7 +193,6 @@ def matches_filters(listing: dict) -> tuple[bool, str]:
     if price is None:
         return False, "geen prijs gevonden"
 
-    # Bepaal type op basis van eerste woord in de card-tekst
     is_studio = text.lower().lstrip().startswith("studio")
     limiet = MAX_PRICE_STUDIO if is_studio else MAX_PRICE_KAMER
     type_label = "studio" if is_studio else "kamer"
@@ -211,7 +226,7 @@ def main() -> int:
         if not ok:
             continue
         if lst["url"] in seen:
-            print(f"    -> al gezien, skip")
+            print("    -> al gezien, skip")
             continue
         new_matches.append(lst)
         seen.add(lst["url"])
