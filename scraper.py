@@ -31,6 +31,8 @@ WIJK_TERMEN: list[list[str]] = [
      "witte de with", "westblaak", "schiedamse vest", "eendrachtsplein"],
     ["kralingen", "kralingse", "kralingsche", "de snor", "kralingsveen",
      "boerengat", "kralingse zoom"],
+    ["noord", "hofdijk", "agniesebuurt", "provenierswijk"],
+    ["crooswijk", "crooswijkse"],
 ]
 
 
